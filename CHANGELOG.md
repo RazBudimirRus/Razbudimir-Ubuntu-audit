@@ -1,0 +1,20 @@
+# Changelog
+
+Все значимые изменения в этом проекте будут документироваться в этом файле.
+Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии по [SemVer](https://semver.org/lang/ru/).
+
+## [1.2.0] - 2026-08-15
+
+Первый публичный релиз.
+
+### Добавлено
+
+- `audit-ubuntu.sh` — read-only сборщик в 17 секций (system, hardware, kernel, packages, services, network, storage, security, performance, logs, containers, apps, configs, drift, monitoring, scheduled)
+- Определение источника (Origin) каждого установленного пакета через `python3-apt`, отдельный список пакетов не из репозиториев Ubuntu
+- Сравнение md5 conffiles с `/var/lib/dpkg/info/*.md5sums` — детект изменённых относительно пакета конфигов
+- Резолвинг слушающих демонов до пакета, пометка «НЕ ИЗ ПАКЕТА» для ручных сборок
+- Маскирование секретов (пароли/токены/community/URL-credentials/приватные ключи) с возможностью отключения через `--no-redact`
+- Машинно-читаемый `facts.json` и человекочитаемая `summary.md` в каждом сборе
+- `manifest.tsv` со всеми артефактами, кодами возврата и таймингами
+- `run-fleet-audit.sh` — параллельный запуск по парку через SSH, сбор архивов, сводный `INDEX.md` и заготовки diff'ов в `compare/`
+- Ключи `--deep`, `--log-days`, `--no-net`, `--no-redact`, `--out`, `--timeout`

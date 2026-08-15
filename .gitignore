@@ -1,0 +1,17 @@
+# Результаты сбора
+fleet-audit-*/
+*.tar.gz
+*.tar.gz.sha256
+
+# Локальный список серверов
+servers.txt
+
+# ОС
+.DS_Store
+Thumbs.db
+
+# Редакторы
+.vscode/
+.idea/
+*.swp
+*~
