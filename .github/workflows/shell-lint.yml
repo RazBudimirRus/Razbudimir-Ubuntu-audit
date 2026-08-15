@@ -1,0 +1,54 @@
+name: Shell Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.sh'
+      - '.github/workflows/shell-lint.yml'
+  pull_request:
+    paths:
+      - '**.sh'
+      - '.github/workflows/shell-lint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: bash -n (syntax check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check bash syntax for every *.sh
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            echo "==> bash -n $f"
+            if ! bash -n "$f"; then
+              echo "::error file=$f::syntax error"
+              fail=1
+            fi
+          done < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
+          exit $fail
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Run shellcheck
+        run: |
+          set -e
+          # Отключаем шумные проверки, не влияющие на корректность:
+          # SC2016 — переменные внутри одинарных кавычек передаются в bash -c намеренно
+          # SC2086 — намеренный word splitting в SSH_OPTS
+          # SC1091 — source динамических файлов
+          # SC2002 — useless cat (стилистика)
+          # SC2126 — grep|wc намеренно для устойчивости в пайплайнах
+          find . -type f -name '*.sh' -not -path './.git/*' -print0 \
+            | xargs -0 shellcheck -S warning -e SC2016,SC2086,SC1091,SC2002,SC2126,SC2001,SC2154
