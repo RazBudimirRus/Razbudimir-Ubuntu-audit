@@ -9,7 +9,7 @@
 #  Использование:
 #     sudo bash audit-ubuntu.sh                       # обычный сбор
 #     sudo bash audit-ubuntu.sh --out /data/audit     # свой каталог
-#     sudo bash audit-ubuntu.sh --deep                # + SMART, полный dpkg -V, fs-скан
+#     sudo bash audit-ubuntu.sh --deep                # + SMART/NVMe, полный dpkg -V, тяжёлые FS-сканы
 #     sudo bash audit-ubuntu.sh --no-redact           # не маскировать секреты (НЕ рекомендуется)
 #     sudo bash audit-ubuntu.sh --no-net              # без внешних сетевых проверок
 #     sudo bash audit-ubuntu.sh --log-days 14         # глубина журналов (по умолчанию 7)
@@ -22,7 +22,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 START_EPOCH=$(date +%s)
 
 # ---------------------------- параметры -------------------------------------
@@ -35,8 +35,6 @@ CMD_TIMEOUT=180
 PROGRESS=auto            # auto|on|off
 SLOW_HINT_MS=10000       # подсвечать команды, работающие дольше N мс
 
-# общее количество run/runif в скрипте (учтёно комментарием для прогресса)
-TOTAL_STEPS=152
 STEP_IDX=0
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +51,41 @@ while [[ $# -gt 0 ]]; do
     *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
 done
+
+# --- валидация CLI (anti-injection) ---
+[[ "$LOG_DAYS" =~ ^[0-9]+$ ]] || { echo "Некорректный --log-days: $LOG_DAYS" >&2; exit 2; }
+[[ "$CMD_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "Некорректный --timeout: $CMD_TIMEOUT" >&2; exit 2; }
+[[ "$PROGRESS" =~ ^(auto|on|off)$ ]] || { echo "Некорректный --progress: $PROGRESS" >&2; exit 2; }
+# запрет metachar в --out (anti-injection в последующие bash -c)
+_bad_out=0
+[[ "$OUTBASE" == *'`'* ]] && _bad_out=1
+[[ "$OUTBASE" == *'$'* ]] && _bad_out=1
+[[ "$OUTBASE" == *'"'* ]] && _bad_out=1
+[[ "$OUTBASE" == *"'"* ]] && _bad_out=1
+[[ "$OUTBASE" == *\\* ]] && _bad_out=1
+if (( _bad_out )); then
+  echo "Некорректный --out (запрещены спецсимволы): $OUTBASE" >&2
+  exit 2
+fi
+unset _bad_out
+# канонизация пути вывода
+OUTBASE="$(mkdir -p "$OUTBASE" && cd "$OUTBASE" && pwd)" || { echo "Не могу создать/войти в --out" >&2; exit 1; }
+
+# динамический TOTAL_STEPS: база без условных шагов
+# (пересчитывается ниже после определения HAVE_APT_ORIGINS)
+# TOTAL_STEPS уточняется ниже после подсчёта; здесь стартовая оценка
+TOTAL_STEPS=152
+(( NETCHECKS )) && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+(( DEEP )) && TOTAL_STEPS=$((TOTAL_STEPS + 2))  # smart + disk-usage-deep
+if command -v python3 >/dev/null 2>&1 && python3 -c "import apt" 2>/dev/null; then
+  TOTAL_STEPS=$((TOTAL_STEPS + 1))  # packages-not-from-ubuntu
+fi
+
+# без GNU timeout тяжёлые команды могут зависнуть навсегда
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "FATAL: нужен GNU timeout (пакет coreutils). Установите и повторите." >&2
+  exit 1
+fi
 
 HOST="$(hostname -f 2>/dev/null || hostname)"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -148,44 +181,71 @@ trap 'finish_progress_line' EXIT INT TERM
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# redact: маскирование очевидных секретов в текстовых артефактах
+# портативный миллисекундный timestamp (GNU date %N; fallback — секунды*1000)
+now_ms() {
+  local n
+  n=$(date +%s%N 2>/dev/null) || { echo $(( $(date +%s) * 1000 )); return; }
+  case "$n" in
+    *[!0-9]*|'') echo $(( $(date +%s) * 1000 )) ;;
+    *) echo $(( n / 1000000 )) ;;
+  esac
+}
+
+iso_now() { date -Is 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S%z"; }
+
+# redact: маскирование секретов (однострочные + PEM-блоки целиком)
 redact_stream() {
   if [[ "$REDACT" -eq 0 ]]; then cat; return; fi
-  sed -E \
-    -e 's/((PASSWORD|PASSWD|PASS|SECRET|TOKEN|APIKEY|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|CLIENT_SECRET|BEARER|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD|psk|pre-shared-key)[[:space:]]*[:=][[:space:]]*)[^[:space:]]+/\1<REDACTED>/Ig' \
-    -e 's/((community|rocommunity|rwcommunity|passphrase|credentials|auth-user-pass)[[:space:]]+)[^[:space:]]+/\1<REDACTED>/Ig' \
+  # сначала вырезаем целые PEM/OpenSSH private key блоки
+  if have perl; then
+    perl -0pe 's/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/gs' \
+      | perl -0pe 's/-----BEGIN OPENSSH PRIVATE KEY-----.*?-----END OPENSSH PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/gs'
+  else
+    awk '
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/ {skip=1; print "<PRIVATE-KEY-REMOVED>"; next}
+      /-----END [A-Z0-9 ]*PRIVATE KEY-----/ {skip=0; next}
+      !skip {print}
+    '
+  fi | sed -E \
+    -e 's/((PASSWORD|PASSWD|PASS|SECRET|TOKEN|APIKEY|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PrivateKey|PresharedKey|SharedKey|CLIENT_SECRET|BEARER|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD|psk|pre-shared-key|passphrase|credentials|aws_secret_access_key|STRIPE_KEY)[[:space:]]*[:=][[:space:]]*)[^[:space:]"\047]+/\1<REDACTED>/Ig' \
+    -e 's/("(PASSWORD|PASSWD|PASS|SECRET|TOKEN|API[_-]?KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|CLIENT_SECRET|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD)"[[:space:]]*:[[:space:]]*")[^"]*(")/\1<REDACTED>\3/Ig' \
+    -e 's/((community|rocommunity|rwcommunity|auth-user-pass)[[:space:]]+)[^[:space:]]+/\1<REDACTED>/Ig' \
     -e 's#(://[^:/@[:space:]]+):[^@[:space:]]+@#\1:<REDACTED>@#g' \
-    -e 's/(ssh-(rsa|ed25519|dss)[[:space:]]+)[A-Za-z0-9+\/=]{40,}/\1<PUBKEY-TRUNCATED>/g' \
-    -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/g' \
+    -e 's/([?&](token|api_key|access_token|secret|password|passwd)=)[^&[:space:]]+/\1<REDACTED>/Ig' \
+    -e 's/((sk-|ssh-)(rsa|ed25519|dss|ecdsa)[^[:space:]]*[[:space:]]+)[A-Za-z0-9+\/=]{40,}/\1<PUBKEY-TRUNCATED>/g' \
     -e 's/(x-api-key|authorization)([[:space:]]*[:=][[:space:]]*).*/\1\2<REDACTED>/Ig'
 }
 
-# run <section> <artifact-file> <описание-команды...>
+# tsv_escape: одна ячейка без табов/переводов строк
+tsv_escape() {
+  local s=$1
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '%s' "$s"
+}
+
+# run <section> <artifact-file> <одна-команда-строка>
 run() {
-  local section="$1"; local artifact="$2"; shift 2
+  local section="$1"; local artifact="$2"; local cmd="$3"
   local target="$OUT/$section/$artifact"
   local t0 t1 rc bytes dur
 
-  # обновить бар перед стартом
   if [[ "$CUR_SECTION" != "$section" ]]; then announce_section "$section"; fi
   CUR_ARTIFACT="$artifact"
   draw_progress
 
-  t0=$(( $(date +%s%N 2>/dev/null || echo 0) / 1000000 ))
+  t0=$(now_ms)
   {
-    printf '### CMD: %s\n### HOST: %s  TIME: %s\n\n' "$*" "$HOST" "$(date -Is)"
+    printf '### CMD: %s\n### HOST: %s  TIME: %s\n\n' "$cmd" "$HOST" "$(iso_now)"
   } > "$target"
-  if have timeout; then
-    timeout -k 5 "$CMD_TIMEOUT" bash -c "$*" 2>&1 | redact_stream >> "$target"
-    rc=${PIPESTATUS[0]}
-  else
-    bash -c "$*" 2>&1 | redact_stream >> "$target"
-    rc=${PIPESTATUS[0]}
-  fi
-  t1=$(( $(date +%s%N 2>/dev/null || echo 0) / 1000000 ))
+  timeout -k 5 "$CMD_TIMEOUT" bash -c "$cmd" 2>&1 | redact_stream >> "$target"
+  rc=${PIPESTATUS[0]}
+  t1=$(now_ms)
   dur=$((t1-t0))
+  (( dur < 0 )) && dur=0
   bytes=$(stat -c %s "$target" 2>/dev/null || echo 0)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$artifact" "$*" "$rc" "$bytes" "$dur" >> "$MANIFEST"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$artifact" "$(tsv_escape "$cmd")" "$rc" "$bytes" "$dur" >> "$MANIFEST"
 
   STEP_IDX=$((STEP_IDX + 1))
   # подсветка медленных команд (>SLOW_HINT_MS)
@@ -383,7 +443,7 @@ run 06-network net-stats-errors.txt       'netstat -s 2>/dev/null || nstat -az 2
 run 06-network proxy-config.txt           'env | grep -i proxy; echo "=== /etc/environment ==="; cat /etc/environment 2>/dev/null; echo "=== apt proxy ==="; grep -ri proxy /etc/apt/apt.conf.d/ 2>/dev/null; echo "=== docker proxy ==="; cat /etc/systemd/system/docker.service.d/*.conf 2>/dev/null'
 
 if [[ "$NETCHECKS" -eq 1 ]]; then
-  run 06-network connectivity.txt 'echo "=== default gw ping ==="; GW=$(ip route | awk "/^default/{print \$3; exit}"); [ -n "$GW" ] && ping -c 3 -W 2 "$GW"; echo "=== 8.8.8.8 ==="; ping -c 3 -W 2 8.8.8.8; echo "=== 1.1.1.1 ==="; ping -c 3 -W 2 1.1.1.1; echo "=== DNS resolve ==="; for h in archive.ubuntu.com security.ubuntu.com github.com; do echo "--- $h"; getent hosts $h; done; echo "=== HTTPS ==="; for u in https://archive.ubuntu.com https://security.ubuntu.com https://github.com; do printf "%-40s " "$u"; curl -sS -o /dev/null -w "%{http_code} %{time_total}s\n" --max-time 8 "$u" 2>&1; done; echo "=== traceroute 8.8.8.8 ==="; (traceroute -n -w 1 -q 1 -m 12 8.8.8.8 2>/dev/null || tracepath -n -m 12 8.8.8.8 2>/dev/null) | head -20; echo "=== MTU path ==="; ping -c 2 -M do -s 1472 8.8.8.8 2>&1 | tail -3; echo "=== apt reachability ==="; apt-get -s update 2>&1 | tail -20'
+  run 06-network connectivity.txt 'echo "=== default gw ping ==="; GW=$(ip route | awk "/^default/{print \$3; exit}"); [ -n "$GW" ] && ping -c 3 -W 2 "$GW"; echo "=== 8.8.8.8 ==="; ping -c 3 -W 2 8.8.8.8; echo "=== 1.1.1.1 ==="; ping -c 3 -W 2 1.1.1.1; echo "=== DNS resolve ==="; for h in archive.ubuntu.com security.ubuntu.com github.com; do echo "--- $h"; getent hosts $h; done; echo "=== HTTPS ==="; for u in https://archive.ubuntu.com https://security.ubuntu.com https://github.com; do printf "%-40s " "$u"; curl -sS -o /dev/null -w "%{http_code} %{time_total}s\n" --max-time 8 "$u" 2>&1; done; echo "=== traceroute 8.8.8.8 ==="; (traceroute -n -w 1 -q 1 -m 12 8.8.8.8 2>/dev/null || tracepath -n -m 12 8.8.8.8 2>/dev/null) | head -20; echo "=== MTU path ==="; ping -c 2 -M do -s 1472 8.8.8.8 2>&1 | tail -3; echo "=== apt sources reachability (HTTP HEAD via curl) ==="; for u in $(grep -rhoE "https?://[^ ]+" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sort -u | head -8); do printf "%-50s " "$u"; curl -sS -o /dev/null -w "%{http_code} %{time_total}s\n" --max-time 8 -I "$u" 2>&1 | tail -1; done'
 fi
 
 # ============================== 07 STORAGE ==================================
@@ -393,7 +453,10 @@ run 07-storage mounts-fstab.txt           'cat /etc/fstab; echo "=== /proc/mount
 run 07-storage lvm.txt                    'pvs -o+pv_used 2>/dev/null; echo; vgs 2>/dev/null; echo; lvs -a -o+devices,lv_layout 2>/dev/null; echo "=== lvm.conf (без комментов) ==="; grep -v "^\s*#" /etc/lvm/lvm.conf 2>/dev/null | grep -v "^\s*$" | head -80'
 run 07-storage raid.txt                   'cat /proc/mdstat 2>/dev/null; mdadm --detail --scan 2>/dev/null; for d in /dev/md*; do [ -b "$d" ] && mdadm --detail "$d" 2>/dev/null; done; echo "=== hw raid ==="; storcli64 /call show 2>/dev/null | head -60; megacli -LDInfo -Lall -aALL 2>/dev/null | head -60; perccli64 /call show 2>/dev/null | head -40'
 run 07-storage zfs-btrfs.txt              'zpool status 2>/dev/null; zpool list 2>/dev/null; zfs list 2>/dev/null; echo "=== btrfs ==="; btrfs filesystem show 2>/dev/null; btrfs filesystem usage / 2>/dev/null'
-run 07-storage disk-usage-top.txt         'du -xhd1 / 2>/dev/null | sort -rh | head -30; echo "=== /var ==="; du -xhd2 /var 2>/dev/null | sort -rh | head -30; echo "=== топ-30 больших файлов (>200M) ==="; find / -xdev -type f -size +200M -printf "%s\t%p\n" 2>/dev/null | sort -rn | head -30'
+run 07-storage disk-usage-top.txt         'du -xhd1 / 2>/dev/null | sort -rh | head -20; echo "=== /var ==="; du -xhd2 /var 2>/dev/null | sort -rh | head -20'
+if [[ "$DEEP" -eq 1 ]]; then
+  run 07-storage disk-usage-deep.txt 'echo "=== топ-30 больших файлов (>200M) ==="; find / -xdev -type f -size +200M -printf "%s\t%p\n" 2>/dev/null | sort -rn | head -30; echo "=== du -xhd3 /var ==="; du -xhd3 /var 2>/dev/null | sort -rh | head -40'
+fi
 run 07-storage io-stats.txt               'iostat -xz 1 3 2>/dev/null || cat /proc/diskstats; echo "=== io schedulers ==="; for d in /sys/block/*/queue/scheduler; do echo "$d: $(cat $d 2>/dev/null)"; done; echo "=== readahead/rotational ==="; for d in /sys/block/*/queue/rotational; do echo "$d: $(cat $d)"; done'
 run 07-storage nfs-cifs-iscsi.txt         'showmount -e localhost 2>/dev/null; cat /etc/exports 2>/dev/null; echo "=== nfs mounts ==="; findmnt -t nfs,nfs4,cifs 2>/dev/null; echo "=== iscsi ==="; iscsiadm -m session 2>/dev/null; iscsiadm -m node 2>/dev/null; echo "=== multipath ==="; multipath -ll 2>/dev/null'
 run 07-storage fs-tune.txt                'for m in $(findmnt -rno TARGET -t ext4,xfs 2>/dev/null); do echo "===== $m"; findmnt -no SOURCE "$m"; done; echo "=== tune2fs ==="; for d in $(findmnt -rno SOURCE -t ext4 2>/dev/null | sort -u); do tune2fs -l "$d" 2>/dev/null | head -30; done; echo "=== xfs_info ==="; for m in $(findmnt -rno TARGET -t xfs 2>/dev/null); do xfs_info "$m" 2>/dev/null; done'
@@ -403,15 +466,20 @@ fi
 
 # ============================== 08 SECURITY =================================
 run 08-security users-groups.txt          'getent passwd | sort -t: -k3 -n; echo "=== группы ==="; getent group | sort; echo "=== пользователи с UID>=1000 ==="; awk -F: "\$3>=1000 && \$3<65534 {print}" /etc/passwd; echo "=== пользователи с shell ==="; grep -vE "(nologin|false)$" /etc/passwd'
-run 08-security passwd-policy.txt         'chage -l root 2>/dev/null; echo "=== аккаунты без пароля/заблокированные ==="; awk -F: "{print \$1\": \"substr(\$2,1,3)}" /etc/shadow 2>/dev/null; echo "=== login.defs ==="; grep -vE "^\s*(#|$)" /etc/login.defs 2>/dev/null; echo "=== pam ==="; grep -rvE "^\s*(#|$)" /etc/pam.d/common-password /etc/pam.d/common-auth /etc/pam.d/sshd 2>/dev/null'
+run 08-security passwd-policy.txt         'chage -l root 2>/dev/null; echo "=== аккаунты без пароля/заблокированные ==="; awk -F: "{h=\$2; if(h==\"\") s=\"empty\"; else if(h ~ /^[!\\*]/) s=\"locked\"; else if(h ~ /^\\\$/) s=\"hashed\"; else s=\"unknown\"; print \$1\": \"s}" /etc/shadow 2>/dev/null; echo "=== login.defs ==="; grep -vE "^\s*(#|$)" /etc/login.defs 2>/dev/null; echo "=== pam ==="; grep -rvE "^\s*(#|$)" /etc/pam.d/common-password /etc/pam.d/common-auth /etc/pam.d/sshd 2>/dev/null'
 run 08-security sudoers.txt               'cat /etc/sudoers 2>/dev/null | grep -vE "^\s*(#|$)"; echo "=== sudoers.d ==="; grep -rvE "^\s*(#|$)" /etc/sudoers.d/ 2>/dev/null; echo "=== члены sudo/admin ==="; getent group sudo admin adm wheel 2>/dev/null'
 run 08-security ssh-config.txt            'sshd -T 2>/dev/null | sort; echo "=== sshd_config (raw) ==="; grep -vE "^\s*(#|$)" /etc/ssh/sshd_config 2>/dev/null; echo "=== sshd_config.d ==="; grep -rvE "^\s*(#|$)" /etc/ssh/sshd_config.d/ 2>/dev/null; echo "=== ssh_config клиент ==="; grep -vE "^\s*(#|$)" /etc/ssh/ssh_config 2>/dev/null; echo "=== host keys (fingerprints) ==="; for k in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$k" 2>/dev/null; done'
 run 08-security authorized-keys.txt       'for h in /root /home/*; do f="$h/.ssh/authorized_keys"; [ -f "$f" ] && { echo "===== $f"; ls -la "$f"; ssh-keygen -lf "$f" 2>/dev/null; }; done'
 run 08-security apparmor-selinux.txt      'aa-status 2>/dev/null; echo "=== профили ==="; ls /etc/apparmor.d/ 2>/dev/null; echo "=== selinux ==="; sestatus 2>/dev/null'
 run 08-security fail2ban.txt              'fail2ban-client status 2>/dev/null; for j in $(fail2ban-client status 2>/dev/null | grep "Jail list" | sed "s/.*:\s*//;s/,//g"); do fail2ban-client status "$j" 2>/dev/null; done; echo "=== конфиг ==="; grep -rvE "^\s*(#|$)" /etc/fail2ban/jail.local /etc/fail2ban/jail.d/ 2>/dev/null'
 run 08-security auth-failures.txt         "zcat -f /var/log/auth.log* 2>/dev/null | grep -Ei 'failed password|invalid user|authentication failure|Failed publickey' | awk '{print \$(NF-3)}' | sort | uniq -c | sort -rn | head -40; echo '=== последние 100 строк с ошибками ==='; zcat -f /var/log/auth.log* 2>/dev/null | grep -Ei 'failed|invalid|error' | tail -100; echo '=== успешные входы ==='; last -F -n 50 2>/dev/null; echo '=== sudo usage ==='; zcat -f /var/log/auth.log* 2>/dev/null | grep -i 'sudo:.*COMMAND' | tail -80"
-run 08-security suid-sgid.txt             'find / -xdev \( -perm -4000 -o -perm -2000 \) -type f -printf "%M %u %g %p\n" 2>/dev/null | sort'
-run 08-security world-writable.txt        'find / -xdev -type d -perm -0002 ! -perm -1000 -printf "%M %p\n" 2>/dev/null | head -50; echo "=== world-writable файлы ==="; find /etc /usr /opt /srv -xdev -type f -perm -0002 -printf "%M %p\n" 2>/dev/null | head -50'
+if [[ "$DEEP" -eq 1 ]]; then
+  run 08-security suid-sgid.txt             'find / -xdev \( -perm -4000 -o -perm -2000 \) -type f -printf "%M %u %g %p\n" 2>/dev/null | sort'
+  run 08-security world-writable.txt        'find / -xdev -type d -perm -0002 ! -perm -1000 -printf "%M %p\n" 2>/dev/null | head -50; echo "=== world-writable файлы ==="; find /etc /usr /opt /srv -xdev -type f -perm -0002 -printf "%M %p\n" 2>/dev/null | head -50'
+else
+  run 08-security suid-sgid.txt             'echo "SKIPPED heavy scan (нужен --deep); быстрый сэмпл:"; find /usr/bin /usr/sbin /bin /sbin -xdev \( -perm -4000 -o -perm -2000 \) -type f -printf "%M %u %g %p\n" 2>/dev/null | sort'
+  run 08-security world-writable.txt        'echo "SKIPPED heavy scan (нужен --deep); сэмпл /etc /tmp:"; find /etc /tmp -xdev -type d -perm -0002 ! -perm -1000 -printf "%M %p\n" 2>/dev/null | head -30'
+fi
 run 08-security certificates.txt          'ls -la /etc/ssl/certs 2>/dev/null | head -20; echo "=== локальные CA ==="; ls -la /usr/local/share/ca-certificates/ 2>/dev/null; echo "=== срок действия сертификатов сервисов ==="; for f in $(find /etc -maxdepth 4 -name "*.crt" -o -maxdepth 4 -name "*.pem" 2>/dev/null | grep -v /etc/ssl/certs | head -40); do echo "--- $f"; openssl x509 -in "$f" -noout -subject -issuer -dates 2>/dev/null; done'
 run 08-security audit-lynis-hints.txt     'auditctl -l 2>/dev/null; echo "=== auditd rules ==="; grep -rvE "^\s*(#|$)" /etc/audit/rules.d/ /etc/audit/auditd.conf 2>/dev/null; echo "=== aide/tripwire ==="; which aide tripwire 2>/dev/null; echo "=== lynis ==="; which lynis 2>/dev/null'
 run 08-security root-history-hint.txt     'ls -la /root/.bash_history /home/*/.bash_history 2>/dev/null; echo "(содержимое history НЕ собирается умышленно — может содержать секреты; при необходимости соберите вручную)"'
@@ -443,7 +511,7 @@ run 10-logs failed-units-logs.txt         'for u in $(systemctl --failed --no-le
 run 11-containers docker-info.txt         'docker version 2>/dev/null; echo; docker info 2>/dev/null; echo "=== daemon.json ==="; cat /etc/docker/daemon.json 2>/dev/null'
 run 11-containers docker-ps.txt           'docker ps -a --no-trunc --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}\t{{.RunningFor}}" 2>/dev/null; echo "=== stats ==="; docker stats --no-stream 2>/dev/null'
 run 11-containers docker-images-volumes.txt 'docker images -a --digests 2>/dev/null; echo "=== volumes ==="; docker volume ls 2>/dev/null; echo "=== networks ==="; docker network ls 2>/dev/null; for n in $(docker network ls -q 2>/dev/null); do docker network inspect "$n" 2>/dev/null | head -40; done; echo "=== disk usage ==="; docker system df -v 2>/dev/null | head -60'
-run 11-containers docker-inspect-all.json 'for c in $(docker ps -aq 2>/dev/null); do docker inspect "$c" 2>/dev/null; done'
+run 11-containers docker-inspect-all.json 'ids=$(docker ps -aq 2>/dev/null | tr "\n" " "); if [ -n "$ids" ]; then docker inspect $ids 2>/dev/null; else echo "[]"; fi'
 run 11-containers docker-compose-files.txt 'find / -xdev -maxdepth 6 \( -name "docker-compose*.y*ml" -o -name "compose.y*ml" \) ! -path "*/node_modules/*" 2>/dev/null | head -40; echo "=== содержимое найденных ==="; for f in $(find /opt /srv /root /home /etc -xdev -maxdepth 5 \( -name "docker-compose*.y*ml" -o -name "compose.y*ml" \) 2>/dev/null | head -15); do echo "----- $f"; cat "$f"; done'
 run 11-containers podman-lxd.txt          'podman ps -a 2>/dev/null; podman images 2>/dev/null; echo "=== lxd/lxc ==="; lxc list 2>/dev/null; lxc-ls -f 2>/dev/null; echo "=== systemd-nspawn ==="; machinectl list 2>/dev/null'
 run 11-containers kubernetes.txt          'kubectl version --short 2>/dev/null; kubectl get nodes -o wide 2>/dev/null; kubectl get pods -A -o wide 2>/dev/null | head -80; echo "=== kubelet ==="; systemctl status kubelet --no-pager 2>/dev/null | head -15; ls /etc/kubernetes 2>/dev/null; echo "=== containerd ==="; crictl info 2>/dev/null | head -30; crictl ps -a 2>/dev/null | head -40; cat /etc/containerd/config.toml 2>/dev/null'
@@ -477,7 +545,11 @@ run 13-configs etc-recent-changes.txt 'find /etc -type f -mtime -90 -printf "%TY
 
 # ============================== 14 DRIFT (главное для стандартизации) =======
 run 14-drift modified-conffiles.txt  'echo "=== conffiles, изменённые относительно пакета (dpkg) ==="; for f in /var/lib/dpkg/info/*.conffiles; do pkg=$(basename "$f" .conffiles); while read -r conf; do [ -f "$conf" ] || continue; md5now=$(md5sum "$conf" 2>/dev/null | cut -d" " -f1); md5pkg=$(grep -E "^[0-9a-f]{32}  ${conf#/}$" /var/lib/dpkg/info/${pkg}.md5sums 2>/dev/null | cut -d" " -f1); [ -n "$md5pkg" ] && [ "$md5now" != "$md5pkg" ] && echo "MODIFIED  $pkg  $conf"; done < "$f"; done | sort'
-run 14-drift dpkg-verify.txt         'dpkg -V 2>/dev/null | head -400'
+if [[ "$DEEP" -eq 1 ]]; then
+  run 14-drift dpkg-verify.txt         'dpkg -V 2>/dev/null'
+else
+  run 14-drift dpkg-verify.txt         'dpkg -V 2>/dev/null | head -400; echo; echo "(усечено до 400 строк; полный прогон: --deep)"'
+fi
 run 14-drift dpkg-not-owned-etc.txt  'comm -23 <(find /etc -type f 2>/dev/null | sort) <(cat /var/lib/dpkg/info/*.list 2>/dev/null | grep "^/etc/" | sort -u) | head -300'
 run 14-drift dpkg-audit.txt          'dpkg --audit; echo "=== half-installed/unpacked ==="; dpkg -l | awk "!/^ii/ && /^[a-z]/ {print}"'
 run 14-drift needrestart.txt         'needrestart -b 2>/dev/null; echo "=== устаревшие библиотеки у процессов ==="; lsof 2>/dev/null | grep -E "DEL|deleted" | awk "{print \$1}" | sort | uniq -c | sort -rn | head -20'
@@ -567,40 +639,97 @@ SUM="$OUT/00-meta/summary.md"
   echo "Полный перечень с кодами возврата: 00-meta/manifest.tsv"
 } > "$SUM" 2>/dev/null
 
-# машинно-читаемый краткий факт-файл для агентов
+# машинно-читаемый краткий факт-файл для агентов (валидный JSON)
+FACTS_TMP=$(mktemp)
 {
-  printf '{\n'
-  printf '  "hostname": "%s",\n' "$HOST"
-  printf '  "collected_at": "%s",\n' "$(date -Is)"
-  printf '  "collector_version": "%s",\n' "$VERSION"
-  printf '  "os": "%s",\n' "$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
-  printf '  "os_version_id": "%s",\n' "$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
-  printf '  "kernel": "%s",\n' "$(uname -r)"
-  printf '  "arch": "%s",\n' "$(uname -m)"
-  printf '  "virtualization": "%s",\n' "$(systemd-detect-virt 2>/dev/null || echo unknown)"
-  printf '  "cpu_count": %s,\n' "$(nproc --all)"
-  printf '  "mem_total_kb": %s,\n' "$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-  printf '  "uptime_seconds": %s,\n' "$(cut -d. -f1 /proc/uptime)"
-  printf '  "packages_installed": %s,\n' "$(dpkg-query -W -f='${Status}\n' 2>/dev/null | grep -c 'install ok installed')"
-  printf '  "packages_upgradable": %s,\n' "$(apt list --upgradable 2>/dev/null | grep -c upgradable)"
-  printf '  "third_party_repos": %s,\n' "$(ls /etc/apt/sources.list.d/ 2>/dev/null | wc -l)"
-  printf '  "failed_units": %s,\n' "$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)"
-  printf '  "reboot_required": %s,\n' "$([[ -f /var/run/reboot-required ]] && echo true || echo false)"
-  printf '  "listening_tcp_ports": %s,\n' "$(ss -tlnH 2>/dev/null | wc -l)"
-  printf '  "docker_containers": %s,\n' "$(docker ps -aq 2>/dev/null | wc -l)"
-  printf '  "journal_errors_window": %s,\n' "$(journalctl -p err -S "-${LOG_DAYS} days" --no-pager 2>/dev/null | wc -l)"
-  printf '  "modified_conffiles": %s\n' "$MODCONF"
-  printf '}\n'
-} > "$OUT/00-meta/facts.json"
+  echo "schema_version=1.1"
+  echo "hostname=$HOST"
+  echo "collected_at=$(iso_now)"
+  echo "collector_version=$VERSION"
+  echo "os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+  echo "os_version_id=$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
+  echo "kernel=$(uname -r)"
+  echo "arch=$(uname -m)"
+  echo "virtualization=$(systemd-detect-virt 2>/dev/null || echo unknown)"
+  echo "cpu_count=$(nproc --all 2>/dev/null || echo 0)"
+  echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  echo "uptime_seconds=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+  echo "packages_installed=$(dpkg-query -W -f='${Status}\n' 2>/dev/null | grep -c 'install ok installed' || true)"
+  echo "packages_upgradable=$(grep -c upgradable "$OUT/04-packages/apt-upgradable.txt" 2>/dev/null || echo 0)"
+  echo "third_party_repos=$(ls /etc/apt/sources.list.d/ 2>/dev/null | wc -l)"
+  echo "failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)"
+  echo "reboot_required=$([[ -f /var/run/reboot-required ]] && echo true || echo false)"
+  echo "listening_tcp_ports=$(ss -tlnH 2>/dev/null | wc -l)"
+  echo "docker_containers=$(docker ps -aq 2>/dev/null | wc -l)"
+  echo "journal_errors_window=$(wc -l < "$OUT/10-logs/journal-errors.txt" 2>/dev/null || echo 0)"
+  echo "modified_conffiles=$MODCONF"
+  echo "deep_mode=$DEEP"
+  echo "run_as_root=$IS_ROOT"
+  echo "redaction=$REDACT"
+} > "$FACTS_TMP"
+
+if have python3; then
+  python3 - "$FACTS_TMP" "$OUT/00-meta/facts.json" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+data = {"schema_version": "1.1"}
+int_keys = {
+  "cpu_count","mem_total_kb","uptime_seconds","packages_installed","packages_upgradable",
+  "third_party_repos","failed_units","listening_tcp_ports","docker_containers",
+  "journal_errors_window","modified_conffiles","deep_mode","run_as_root","redaction"
+}
+bool_keys = {"reboot_required"}
+with open(src, encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k in bool_keys:
+            data[k] = v.strip().lower() in ("true", "1", "yes")
+        elif k in int_keys:
+            try:
+                data[k] = int(str(v).strip() or 0)
+            except ValueError:
+                data[k] = 0
+        else:
+            data[k] = v
+with open(dst, "w", encoding="utf-8") as out:
+    json.dump(data, out, ensure_ascii=False, indent=2)
+    out.write("\n")
+PY
+else
+  # fallback без python: минимальный JSON без сложных escape (hostname/os уже без кавычек обычно)
+  log "WARNING: python3 нет — facts.json пишется упрощённо"
+  {
+    printf '{\n  "schema_version": "1.1",\n'
+    while IFS='=' read -r k v; do
+      [[ -z "$k" ]] && continue
+      printf '  "%s": "%s",\n' "$k" "${v//\"/\\\"}"
+    done < "$FACTS_TMP"
+    printf '  "note": "install python3 for strict JSON"\n}\n'
+  } > "$OUT/00-meta/facts.json"
+fi
+rm -f "$FACTS_TMP"
 
 # ============================== УПАКОВКА ====================================
 DURATION=$(( $(date +%s) - START_EPOCH ))
 echo "collection_duration_seconds: $DURATION" >> "$OUT/00-meta/collection-info.txt"
 
 TARBALL="${OUTBASE}/${HOST}-${TS}.tar.gz"
-tar -czf "$TARBALL" -C "$OUTBASE" "${HOST}-${TS}" 2>/dev/null
-sha256sum "$TARBALL" > "${TARBALL}.sha256" 2>/dev/null
-chmod 600 "$TARBALL" "${TARBALL}.sha256" 2>/dev/null
+if ! tar -czf "$TARBALL" -C "$OUTBASE" "${HOST}-${TS}"; then
+  log "FATAL: не удалось создать архив $TARBALL"
+  exit 1
+fi
+if have sha256sum; then
+  sha256sum "$TARBALL" > "${TARBALL}.sha256"
+else
+  log "WARNING: sha256sum недоступен — checksum не создан"
+fi
+chmod 600 "$TARBALL" "${TARBALL}.sha256" 2>/dev/null || true
+
+# актуализируем TOTAL_STEPS в логе (факт)
+echo "steps_completed: $STEP_IDX (planned=$TOTAL_STEPS)" >> "$OUT/00-meta/collection-info.txt"
 
 finish_progress_line
 log "Готово за ${DURATION}s."
