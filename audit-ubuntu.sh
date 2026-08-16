@@ -22,7 +22,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 START_EPOCH=$(date +%s)
 
 # ---------------------------- параметры -------------------------------------
@@ -32,6 +32,12 @@ REDACT=1
 NETCHECKS=1
 LOG_DAYS=7
 CMD_TIMEOUT=180
+PROGRESS=auto            # auto|on|off
+SLOW_HINT_MS=10000       # подсвечать команды, работающие дольше N мс
+
+# общее количество run/runif в скрипте (учтёно комментарием для прогресса)
+TOTAL_STEPS=152
+STEP_IDX=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +47,8 @@ while [[ $# -gt 0 ]]; do
     --no-net)     NETCHECKS=0; shift ;;
     --log-days)   LOG_DAYS="${2:?}"; shift 2 ;;
     --timeout)    CMD_TIMEOUT="${2:?}"; shift 2 ;;
+    --progress)   PROGRESS="${2:?}"; shift 2 ;;
+    --no-progress) PROGRESS=off; shift ;;
     -h|--help)    sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "Неизвестный аргумент: $1" >&2; exit 2 ;;
   esac
@@ -64,6 +72,78 @@ LOGFILE="$OUT/00-meta/collector.log"
 
 IS_ROOT=0; [[ "$(id -u)" -eq 0 ]] && IS_ROOT=1
 
+# --------------------- прогресс-бар --------------------------------
+if [[ "$PROGRESS" == "auto" ]]; then
+  if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then PROGRESS=on; else PROGRESS=off; fi
+fi
+
+BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+if [[ "$PROGRESS" != "on" ]]; then BOLD=; DIM=; RED=; GRN=; YLW=; CYN=; RST=; fi
+
+CUR_SECTION=""
+CUR_ARTIFACT=""
+SLOW_CMDS=0
+BAR_WIDTH=30
+
+_hms() {  # в входе — секунды, на выходе 5s / 1m23s / 12m5s
+  local s=$1
+  (( s < 0 )) && { printf -- '--'; return; }
+  if (( s < 60 )); then printf '%ds' "$s"
+  elif (( s < 3600 )); then printf '%dm%02ds' $((s/60)) $((s%60))
+  else printf '%dh%02dm' $((s/3600)) $(((s%3600)/60)); fi
+}
+
+draw_progress() {
+  [[ "$PROGRESS" != "on" ]] && return 0
+  local done=$STEP_IDX total=$TOTAL_STEPS
+  (( total < 1 )) && total=1
+  local pct=$(( done * 100 / total ))
+  (( pct > 100 )) && pct=100
+  local filled=$(( done * BAR_WIDTH / total ))
+  (( filled > BAR_WIDTH )) && filled=$BAR_WIDTH
+  local bar='' i
+  for ((i=0; i<filled; i++)); do bar+='█'; done
+  for ((i=filled; i<BAR_WIDTH; i++)); do bar+='░'; done
+
+  local now_s=$(( $(date +%s) - START_EPOCH ))
+  local eta_str='--'
+  if (( done > 3 && done < total )); then
+    local eta=$(( now_s * (total - done) / done ))
+    eta_str=$(_hms "$eta")
+  fi
+  local elapsed_str; elapsed_str=$(_hms "$now_s")
+
+  local sec="${CUR_SECTION:-—}"
+  local art="${CUR_ARTIFACT:-—}"
+  # обрезаем до ~40 символов чтобы не вылезать за границу
+  [[ ${#art} -gt 40 ]] && art="${art:0:37}..."
+
+  # \r в начале, \e[K — стереть до конца строки
+  printf '\r\e[K%s[%s]%s %3d%% %s%d/%d%s · ⏱ %s · ETA %s · %s%s%s/%s%s' \
+    "$CYN" "$bar" "$RST" "$pct" "$DIM" "$done" "$total" "$RST" \
+    "$elapsed_str" "$eta_str" \
+    "$BOLD" "$sec" "$RST" "$DIM" "$art$RST" >&2
+}
+
+announce_section() {
+  local sec="$1"
+  CUR_SECTION="$sec"
+  if [[ "$PROGRESS" == "on" ]]; then
+    # печатаем заголовок новой строкой над баром
+    printf '\r\e[K%s[%s]%s %s\n' "$GRN" "$(date +%H:%M:%S)" "$RST" "$sec" >&2
+    draw_progress
+  else
+    log "▶ $sec"
+  fi
+}
+
+finish_progress_line() {
+  [[ "$PROGRESS" == "on" ]] && printf '\r\e[K' >&2
+}
+
+# при корректном выходе/ошибке убираем недонарисованный бар
+trap 'finish_progress_line' EXIT INT TERM
+
 # ---------------------------- хелперы --------------------------------------
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -84,7 +164,13 @@ redact_stream() {
 run() {
   local section="$1"; local artifact="$2"; shift 2
   local target="$OUT/$section/$artifact"
-  local t0 t1 rc bytes
+  local t0 t1 rc bytes dur
+
+  # обновить бар перед стартом
+  if [[ "$CUR_SECTION" != "$section" ]]; then announce_section "$section"; fi
+  CUR_ARTIFACT="$artifact"
+  draw_progress
+
   t0=$(( $(date +%s%N 2>/dev/null || echo 0) / 1000000 ))
   {
     printf '### CMD: %s\n### HOST: %s  TIME: %s\n\n' "$*" "$HOST" "$(date -Is)"
@@ -97,16 +183,36 @@ run() {
     rc=${PIPESTATUS[0]}
   fi
   t1=$(( $(date +%s%N 2>/dev/null || echo 0) / 1000000 ))
+  dur=$((t1-t0))
   bytes=$(stat -c %s "$target" 2>/dev/null || echo 0)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$artifact" "$*" "$rc" "$bytes" "$((t1-t0))" >> "$MANIFEST"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$section" "$artifact" "$*" "$rc" "$bytes" "$dur" >> "$MANIFEST"
+
+  STEP_IDX=$((STEP_IDX + 1))
+  # подсветка медленных команд (>SLOW_HINT_MS)
+  if [[ "$PROGRESS" == "on" ]] && (( dur > SLOW_HINT_MS )); then
+    SLOW_CMDS=$((SLOW_CMDS+1))
+    printf '\r\e[K%s[%s]%s %s⚠ %s/%s — %ss%s\n' \
+      "$YLW" "$(date +%H:%M:%S)" "$RST" "$DIM" "$section" "$artifact" "$((dur/1000))" "$RST" >&2
+  fi
+  # ошибка таймаута или критичный сбой тоже стоит показать
+  if [[ "$PROGRESS" == "on" ]] && (( rc == 124 )); then
+    printf '\r\e[K%s[%s]%s %s⏱ timeout: %s/%s%s\n' \
+      "$RED" "$(date +%H:%M:%S)" "$RST" "$DIM" "$section" "$artifact" "$RST" >&2
+  fi
+  draw_progress
   return 0
 }
 
 # runif <cmd> <section> <artifact> <команда...>
 runif() {
   local req="$1"; shift
-  if have "$req"; then run "$@"; else
+  if have "$req"; then run "$@";
+  else
     printf '%s\t%s\tSKIPPED (нет %s)\t127\t0\t0\n' "$1" "$2" "$req" >> "$MANIFEST"
+    STEP_IDX=$((STEP_IDX + 1))
+    if [[ "$CUR_SECTION" != "$1" ]]; then announce_section "$1"; fi
+    CUR_ARTIFACT="$2 (— нет $req)"
+    draw_progress
   fi
 }
 
@@ -134,7 +240,14 @@ copy_cfg() {
   stat -c '%A %U:%G %n' "$src" >> "$OUT/13-configs/_permissions.txt" 2>/dev/null
 }
 
-log "audit-ubuntu.sh v$VERSION → $OUT (root=$IS_ROOT, deep=$DEEP, redact=$REDACT)"
+log "audit-ubuntu.sh v$VERSION → $OUT (root=$IS_ROOT, deep=$DEEP, redact=$REDACT, progress=$PROGRESS)"
+if [[ "$PROGRESS" == "on" ]]; then
+  printf '%s╔%s═ audit-ubuntu.sh v%s %s══%s\n' "$CYN" "$RST$BOLD" "$VERSION" "$RST$CYN" "$RST" >&2
+  printf '%s║%s host=%s | root=%s | deep=%s | log-days=%s | net=%s %s\n' \
+    "$CYN" "$RST" "$HOST" "$IS_ROOT" "$DEEP" "$LOG_DAYS" "$NETCHECKS" "$RST" >&2
+  printf '%s╚%s══ шагов: %d | таймаут команды: %sс | вывод: %s %s\n' \
+    "$CYN" "$RST" "$TOTAL_STEPS" "$CMD_TIMEOUT" "$OUT" "$RST" >&2
+fi
 [[ "$IS_ROOT" -eq 1 ]] || log "ВНИМАНИЕ: запуск не от root — часть данных будет недоступна. Рекомендуется sudo."
 
 # ============================== 00 META =====================================
@@ -382,6 +495,7 @@ run 16-scheduled systemd-timers.txt  'systemctl list-timers --all --no-pager 2>/
 run 16-scheduled anacron.txt         'cat /etc/anacrontab 2>/dev/null; cat /var/spool/anacron/* 2>/dev/null'
 
 # ============================== СВОДКА ======================================
+finish_progress_line
 log "Формирую сводку summary.md ..."
 MODCONF=$(grep -c '^MODIFIED' "$OUT/14-drift/modified-conffiles.txt" 2>/dev/null | head -1); MODCONF=${MODCONF:-0}
 OOMCNT=$(grep -ciE 'out of memory|oom-kill|panic|call trace' "$OUT/10-logs/oom-and-panic.txt" 2>/dev/null | head -1); OOMCNT=${OOMCNT:-0}
@@ -488,15 +602,32 @@ tar -czf "$TARBALL" -C "$OUTBASE" "${HOST}-${TS}" 2>/dev/null
 sha256sum "$TARBALL" > "${TARBALL}.sha256" 2>/dev/null
 chmod 600 "$TARBALL" "${TARBALL}.sha256" 2>/dev/null
 
+finish_progress_line
 log "Готово за ${DURATION}s."
-echo
-echo "==================================================================="
-echo " Каталог:  $OUT"
-echo " Архив:    $TARBALL  ($(du -h "$TARBALL" 2>/dev/null | cut -f1))"
-echo " Сводка:   $OUT/00-meta/summary.md"
-echo " Факты:    $OUT/00-meta/facts.json"
-echo " Файлов:   $(find "$OUT" -type f | wc -l)"
-echo "==================================================================="
-echo " Забрать с рабочей машины:"
-echo "   scp $(whoami)@${HOST}:${TARBALL} ./"
-echo "==================================================================="
+
+# топ-5 самых долгих команд в сводку
+TOP_SLOW=$(awk -F'\t' 'NR>1 && $6+0>0 {printf "%s/%s (%.1fs)\n", $1, $2, $6/1000}' "$MANIFEST" | sort -t'(' -k2 -rn | head -5)
+
+if [[ "$PROGRESS" == "on" ]]; then
+  printf '\n%s╔%s═ Готово за %s %s══%s\n' "$GRN" "$RST$BOLD" "$(_hms "$DURATION")" "$RST$GRN" "$RST" >&2
+  printf '%s║%s Каталог: %s\n' "$GRN" "$RST" "$OUT" >&2
+  printf '%s║%s Архив:  %s (%s)\n' "$GRN" "$RST" "$TARBALL" "$(du -h "$TARBALL" 2>/dev/null | cut -f1)" >&2
+  printf '%s║%s Файлов: %s | Медленных команд (>%ss): %s\n' \
+    "$GRN" "$RST" "$(find "$OUT" -type f | wc -l)" "$((SLOW_HINT_MS/1000))" "$SLOW_CMDS" >&2
+  printf '%s╚%s══ scp $(whoami)@%s:%s ./ %s\n\n' "$GRN" "$RST" "$HOST" "$TARBALL" "$RST" >&2
+  if [[ -n "$TOP_SLOW" ]]; then
+    printf '%sТоп-5 долгих команд:%s\n%s\n\n' "$DIM" "$RST" "$TOP_SLOW" >&2
+  fi
+else
+  echo
+  echo "==================================================================="
+  echo " Каталог:  $OUT"
+  echo " Архив:    $TARBALL  ($(du -h "$TARBALL" 2>/dev/null | cut -f1))"
+  echo " Сводка:   $OUT/00-meta/summary.md"
+  echo " Факты:    $OUT/00-meta/facts.json"
+  echo " Файлов:   $(find "$OUT" -type f | wc -l)"
+  echo "==================================================================="
+  echo " Забрать с рабочей машины:"
+  echo "   scp $(whoami)@${HOST}:${TARBALL} ./"
+  echo "==================================================================="
+fi
