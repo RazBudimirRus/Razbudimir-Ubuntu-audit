@@ -47,6 +47,8 @@ AUDIT_ARGS="--deep --log-days 14 --no-net" ./run-fleet-audit.sh
 
 Формат `servers.txt`: `user@host`, `user@host:port`, IPv6 — `user@[2001:db8::1]:22`.
 
+Для **первого слепка** не используйте cloud-init `ubuntu` с `NOPASSWD: ALL`: заведите временного `auditor`, прогоните fleet, сразу снесите. Команды: [first-snapshot.md](first-snapshot.md).
+
 На выходе: `fleet-audit-YYYYMMDD-HHMM/` с архивами всех серверов, распакованными каталогами, сводным `INDEX.md` (таблица по парку) и `compare/` — заготовками diff'ов по ключевым артефактам. После успешного копирования remote-архивы удаляются (оставить: `KEEP_REMOTE=1`).
 
 ## Ключи `audit-ubuntu.sh`
@@ -223,6 +225,7 @@ sudo chmod +x /etc/cron.weekly/server-audit
 ```
 audit-ubuntu.sh        основной сборщик, кладётся на каждый сервер
 run-fleet-audit.sh     раннер по парку с рабочей машины (SSH + сбор архивов + сводный INDEX)
+first-snapshot.md      команды первого слепка: временный auditor, sudoers, снятие
 CHANGELOG.md           история версий
 LICENSE                MIT
 README.md              этот файл
