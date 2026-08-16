@@ -20,6 +20,28 @@
 set -uo pipefail
 umask 077
 
+fleet_remote_dir_from_ssh_stdout() {
+  tr -d '\r' | awk 'NF { line = $0 } END { print line }'
+}
+
+valid_fleet_run_dir() {
+  case "$1" in
+    */.cache/razbudimir-audit/run.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# stdin: сырой stdout ssh (может содержать MOTD); stdout: путь mktemp
+if [[ "${1:-}" == --check-remote-dir ]]; then
+  path=$(fleet_remote_dir_from_ssh_stdout)
+  if valid_fleet_run_dir "$path"; then
+    printf '%s\n' "$path"
+    exit 0
+  fi
+  echo "bad remote dir: $path" >&2
+  exit 1
+fi
+
 # bash ≥4 (mapfile, ассоциативные массивы не обязательны, но mapfile нужен)
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   echo "Нужен bash ≥4 (сейчас $BASH_VERSION). На macOS: brew install bash && /opt/homebrew/bin/bash $0" >&2
@@ -178,8 +200,13 @@ audit_one() {
   echo "[$safe_label] запуск..."
   {
     # безопасный каталог только для нашего пользователя (не world-writable /tmp)
-    remote_dir=$(ssh -p "$port" "${SSH_OPTS_ARR[@]}" "$userhost" 'mkdir -p "$HOME/.cache/razbudimir-audit" && mktemp -d "$HOME/.cache/razbudimir-audit/run.XXXXXX"') \
+    remote_raw=$(ssh -p "$port" "${SSH_OPTS_ARR[@]}" "$userhost" 'mkdir -p "$HOME/.cache/razbudimir-audit" && mktemp -d "$HOME/.cache/razbudimir-audit/run.XXXXXX"') \
       || return 1
+    remote_dir=$(printf '%s\n' "$remote_raw" | fleet_remote_dir_from_ssh_stdout)
+    if ! valid_fleet_run_dir "$remote_dir"; then
+      echo "[$safe_label] ОШИБКА: неожиданный remote dir (MOTD?): $remote_dir"
+      return 1
+    fi
     remote_script="${remote_dir}/audit-ubuntu.sh"
 
     scp -P "$port" "${SSH_OPTS_ARR[@]}" "$SCRIPT" "${userhost}:${remote_script}" || return 1
@@ -226,7 +253,7 @@ audit_one() {
   echo "[$safe_label] OK -> $LOCAL_DIR/${safe_label}.tar.gz"
 }
 
-export -f audit_one parse_target iso_now
+export -f audit_one parse_target iso_now fleet_remote_dir_from_ssh_stdout valid_fleet_run_dir
 export LOCAL_DIR SCRIPT AUDIT_ARGS KEEP_REMOTE LOCAL_SHA
 export SSH_OPTS_ARR PARALLEL
 # SSH_OPTS_ARR не экспортируется как массив в bash — передаём через строку
@@ -252,7 +279,7 @@ for s in "${SERVERS[@]}"; do
     pids=()
   fi
 done
-for pid in "${pids[@]:-}"; do
+for pid in "${pids[@]}"; do
   wait "$pid" || fail=1
 done
 

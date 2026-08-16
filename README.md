@@ -23,8 +23,8 @@
 ### Один сервер
 
 ```bash
-scp audit-ubuntu.sh user@server:/tmp/
-ssh user@server 'sudo bash /tmp/audit-ubuntu.sh --deep'
+scp audit-ubuntu.sh user@server:~/
+ssh user@server 'install -D -m 700 audit-ubuntu.sh ~/.cache/razbudimir-audit/audit-ubuntu.sh && sudo bash ~/.cache/razbudimir-audit/audit-ubuntu.sh --deep'
 # в конце скрипт напечатает путь к .tar.gz
 scp user@server:/var/tmp/server-audit/<host>-<ts>.tar.gz ./
 ```
@@ -155,8 +155,8 @@ AUDIT_ARGS="--deep --log-days 14 --no-net" ./run-fleet-audit.sh
 - Пароли и токены в `KEY=value` — `PASSWORD/PASSWD/PASS/SECRET/TOKEN/APIKEY/API_KEY/ACCESS_KEY/SECRET_KEY/PRIVATE_KEY/CLIENT_SECRET/BEARER/AUTH_TOKEN/DB_PASS/MYSQL_PWD/PGPASSWORD/psk/pre-shared-key`
 - Credentials в URL: `https://user:pass@host` → `https://user:<REDACTED>@host`
 - SNMP community, WireGuard PSK, `passphrase`, `auth-user-pass`, `Authorization` и `x-api-key` заголовки
-- Публичные SSH-ключи усекаются; приватные PEM/OpenSSH-блоки вырезаются **целиком** (от BEGIN до END)
-- WireGuard `PrivateKey`/`PresharedKey`, JSON `"password":"…"`, URL-query `token=`/`api_key=`
+- Публичные SSH-ключи усекаются; приватные PEM/OpenSSH/PGP-блоки вырезаются **целиком** (от BEGIN до END)
+- WireGuard `PrivateKey`/`PresharedKey`, JSON `"password":"…"`, YAML `password:`, URL-query `token=`/`api_key=`
 - Приватные ключи (`*.key`, `*.pem`, `id_*`, `*.p12`, `*.pfx`, `*.jks`) не копируются вообще
 - `bash_history` умышленно не собирается — часто содержит секреты в открытом виде
 - Из `/etc/shadow` — только статус `empty|locked|hashed|unknown` (без префикса хеша)

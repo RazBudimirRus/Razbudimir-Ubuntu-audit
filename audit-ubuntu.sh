@@ -37,6 +37,41 @@ SLOW_HINT_MS=10000       # подсвечать команды, работающ
 
 STEP_IDX=0
 
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# redact: маскирование секретов (однострочные + PEM-блоки целиком)
+redact_stream() {
+  if [[ "$REDACT" -eq 0 ]]; then cat; return; fi
+  # сначала вырезаем целые PEM/OpenSSH/PGP private key блоки
+  if have perl; then
+    perl -0pe 's/-----BEGIN PGP PRIVATE KEY BLOCK-----.*?-----END PGP PRIVATE KEY BLOCK-----/<PRIVATE-KEY-REMOVED>/gs;
+               s/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/gs;
+               s/-----BEGIN OPENSSH PRIVATE KEY-----.*?-----END OPENSSH PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/gs'
+  else
+    awk '
+      /-----BEGIN PGP PRIVATE KEY BLOCK-----/ {skip=1; print "<PRIVATE-KEY-REMOVED>"; next}
+      /-----END PGP PRIVATE KEY BLOCK-----/ {skip=0; next}
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/ {skip=1; print "<PRIVATE-KEY-REMOVED>"; next}
+      /-----END [A-Z0-9 ]*PRIVATE KEY-----/ {skip=0; next}
+      !skip {print}
+    '
+  fi | sed -E \
+    -e 's/((PASSWORD|PASSWD|PASS|SECRET|TOKEN|APIKEY|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PrivateKey|PresharedKey|SharedKey|CLIENT_SECRET|BEARER|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD|psk|pre-shared-key|passphrase|credentials|aws_secret_access_key|STRIPE_KEY)[[:space:]]*[:=][[:space:]]*)[^[:space:]"\047]+/\1<REDACTED>/Ig' \
+    -e 's/("(PASSWORD|PASSWD|PASS|SECRET|TOKEN|API[_-]?KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|CLIENT_SECRET|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD)"[[:space:]]*:[[:space:]]*")[^"]*(")/\1<REDACTED>\3/Ig' \
+    -e 's/(^|[[:space:]])(password)[[:space:]]*:[[:space:]]*[^[:space:]#]+/\1\2: <REDACTED>/Ig' \
+    -e 's/((community|rocommunity|rwcommunity|auth-user-pass)[[:space:]]+)[^[:space:]]+/\1<REDACTED>/Ig' \
+    -e 's#(://[^:/@[:space:]]+):[^@[:space:]]+@#\1:<REDACTED>@#g' \
+    -e 's/([?&](token|api_key|access_token|secret|password|passwd)=)[^&[:space:]]+/\1<REDACTED>/Ig' \
+    -e 's/((sk-|ssh-)(rsa|ed25519|dss|ecdsa)[^[:space:]]*[[:space:]]+)[A-Za-z0-9+\/=]{40,}/\1<PUBKEY-TRUNCATED>/g' \
+    -e 's/(x-api-key|authorization)([[:space:]]*[:=][[:space:]]*).*/\1\2<REDACTED>/Ig'
+}
+
+# фильтр stdin → stdout (тесты и ручная проверка маскирования)
+if [[ "${1:-}" == --redact-stdin ]]; then
+  redact_stream
+  exit 0
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out)        OUTBASE="${2:?}"; shift 2 ;;
@@ -68,8 +103,36 @@ if (( _bad_out )); then
   exit 2
 fi
 unset _bad_out
-# канонизация пути вывода
-OUTBASE="$(mkdir -p "$OUTBASE" && cd "$OUTBASE" && pwd)" || { echo "Не могу создать/войти в --out" >&2; exit 1; }
+
+dir_owner() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"; }
+
+# каталог вывода должен принадлежать нам и не быть symlink (anti-TOCTOU в /var/tmp)
+assert_owned_dir() {
+  local d="$1"
+  if [[ -L "$d" ]]; then
+    echo "Отказ: --out является symlink: $d" >&2
+    return 1
+  fi
+  if [[ ! -d "$d" ]]; then
+    echo "Отказ: --out не каталог: $d" >&2
+    return 1
+  fi
+  local owner
+  owner=$(dir_owner "$d") || { echo "Отказ: не могу stat $d" >&2; return 1; }
+  if [[ "$owner" != "$(id -u)" ]]; then
+    echo "Отказ: $d принадлежит uid $owner, а не $(id -u) (чужой каталог)" >&2
+    return 1
+  fi
+  return 0
+}
+
+if [[ -e "$OUTBASE" || -L "$OUTBASE" ]]; then
+  assert_owned_dir "$OUTBASE" || exit 1
+else
+  mkdir -p "$OUTBASE" || { echo "Не могу создать --out: $OUTBASE" >&2; exit 1; }
+  assert_owned_dir "$OUTBASE" || exit 1
+fi
+OUTBASE="$(cd "$OUTBASE" && pwd)" || { echo "Не могу войти в --out" >&2; exit 1; }
 
 # динамический TOTAL_STEPS: база без условных шагов
 # (пересчитывается ниже после определения HAVE_APT_ORIGINS)
@@ -88,9 +151,16 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 HOST="$(hostname -f 2>/dev/null || hostname)"
+HOST="${HOST//\//_}"
+HOST="${HOST// /_}"
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT="${OUTBASE}/${HOST}-${TS}"
-mkdir -p "$OUT" || { echo "Не могу создать $OUT" >&2; exit 1; }
+if [[ -e "$OUT" || -L "$OUT" ]]; then
+  echo "Отказ: каталог сбора уже существует: $OUT" >&2
+  exit 1
+fi
+mkdir "$OUT" || { echo "Не могу создать $OUT" >&2; exit 1; }
+assert_owned_dir "$OUT" || exit 1
 
 for d in 00-meta 01-system 02-hardware 03-kernel 04-packages 05-services \
          06-network 07-storage 08-security 09-performance 10-logs 11-containers \
@@ -179,7 +249,6 @@ trap 'finish_progress_line' EXIT INT TERM
 
 # ---------------------------- хелперы --------------------------------------
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE" >&2; }
-have() { command -v "$1" >/dev/null 2>&1; }
 
 # портативный миллисекундный timestamp (GNU date %N; fallback — секунды*1000)
 now_ms() {
@@ -192,29 +261,6 @@ now_ms() {
 }
 
 iso_now() { date -Is 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S%z"; }
-
-# redact: маскирование секретов (однострочные + PEM-блоки целиком)
-redact_stream() {
-  if [[ "$REDACT" -eq 0 ]]; then cat; return; fi
-  # сначала вырезаем целые PEM/OpenSSH private key блоки
-  if have perl; then
-    perl -0pe 's/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/gs' \
-      | perl -0pe 's/-----BEGIN OPENSSH PRIVATE KEY-----.*?-----END OPENSSH PRIVATE KEY-----/<PRIVATE-KEY-REMOVED>/gs'
-  else
-    awk '
-      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/ {skip=1; print "<PRIVATE-KEY-REMOVED>"; next}
-      /-----END [A-Z0-9 ]*PRIVATE KEY-----/ {skip=0; next}
-      !skip {print}
-    '
-  fi | sed -E \
-    -e 's/((PASSWORD|PASSWD|PASS|SECRET|TOKEN|APIKEY|API_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|PrivateKey|PresharedKey|SharedKey|CLIENT_SECRET|BEARER|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD|psk|pre-shared-key|passphrase|credentials|aws_secret_access_key|STRIPE_KEY)[[:space:]]*[:=][[:space:]]*)[^[:space:]"\047]+/\1<REDACTED>/Ig' \
-    -e 's/("(PASSWORD|PASSWD|PASS|SECRET|TOKEN|API[_-]?KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|CLIENT_SECRET|AUTH_TOKEN|DB_PASS|MYSQL_PWD|PGPASSWORD)"[[:space:]]*:[[:space:]]*")[^"]*(")/\1<REDACTED>\3/Ig' \
-    -e 's/((community|rocommunity|rwcommunity|auth-user-pass)[[:space:]]+)[^[:space:]]+/\1<REDACTED>/Ig' \
-    -e 's#(://[^:/@[:space:]]+):[^@[:space:]]+@#\1:<REDACTED>@#g' \
-    -e 's/([?&](token|api_key|access_token|secret|password|passwd)=)[^&[:space:]]+/\1<REDACTED>/Ig' \
-    -e 's/((sk-|ssh-)(rsa|ed25519|dss|ecdsa)[^[:space:]]*[[:space:]]+)[A-Za-z0-9+\/=]{40,}/\1<PUBKEY-TRUNCATED>/g' \
-    -e 's/(x-api-key|authorization)([[:space:]]*[:=][[:space:]]*).*/\1\2<REDACTED>/Ig'
-}
 
 # tsv_escape: одна ячейка без табов/переводов строк
 tsv_escape() {
@@ -655,13 +701,13 @@ FACTS_TMP=$(mktemp)
   echo "mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   echo "uptime_seconds=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
   echo "packages_installed=$(dpkg-query -W -f='${Status}\n' 2>/dev/null | grep -c 'install ok installed' || true)"
-  echo "packages_upgradable=$(grep -c upgradable "$OUT/04-packages/apt-upgradable.txt" 2>/dev/null || echo 0)"
+  echo "packages_upgradable=$(grep -c '\[upgradable' "$OUT/04-packages/apt-upgradable.txt" 2>/dev/null || true)"
   echo "third_party_repos=$(ls /etc/apt/sources.list.d/ 2>/dev/null | wc -l)"
   echo "failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | wc -l)"
   echo "reboot_required=$([[ -f /var/run/reboot-required ]] && echo true || echo false)"
   echo "listening_tcp_ports=$(ss -tlnH 2>/dev/null | wc -l)"
   echo "docker_containers=$(docker ps -aq 2>/dev/null | wc -l)"
-  echo "journal_errors_window=$(wc -l < "$OUT/10-logs/journal-errors.txt" 2>/dev/null || echo 0)"
+  echo "journal_errors_window=$(tail -n +4 "$OUT/10-logs/journal-errors.txt" 2>/dev/null | wc -l | tr -d ' ')"
   echo "modified_conffiles=$MODCONF"
   echo "deep_mode=$DEEP"
   echo "run_as_root=$IS_ROOT"
