@@ -1,5 +1,7 @@
 # Razbudimir-Ubuntu-audit
 
+**Версия: 1.4.0** — hardening (redact PEM/WG, fleet TOCTOU fix, `--deep` gating, `facts.json` schema).
+
 Полновесный read-only сборщик инвентаризационно-диагностических данных с Ubuntu-серверов для последующего анализа AI-агентами и стандартизации через Ansible.
 
 Скрипт заходит на сервер, собирает всё — от `dpkg` и `sshd -T` до `ethtool`, `journalctl -p err`, изменённых относительно пакета конфигов и статусов мониторинг-агентов — и упаковывает в архив, готовый к скармливанию LLM.
@@ -21,8 +23,8 @@
 ### Один сервер
 
 ```bash
-scp audit-ubuntu.sh user@server:/tmp/
-ssh user@server 'sudo bash /tmp/audit-ubuntu.sh --deep'
+scp audit-ubuntu.sh user@server:~/
+ssh user@server 'install -D -m 700 audit-ubuntu.sh ~/.cache/razbudimir-audit/audit-ubuntu.sh && sudo bash ~/.cache/razbudimir-audit/audit-ubuntu.sh --deep'
 # в конце скрипт напечатает путь к .tar.gz
 scp user@server:/var/tmp/server-audit/<host>-<ts>.tar.gz ./
 ```
@@ -39,27 +41,34 @@ ubuntu@10.0.0.15
 ubuntu@10.0.0.16
 EOF
 chmod +x run-fleet-audit.sh
-AUDIT_ARGS="--deep --log-days 14" ./run-fleet-audit.sh
+# по умолчанию: --deep --no-net; нужен passwordless sudo (sudo -n) и bash ≥4
+AUDIT_ARGS="--deep --log-days 14 --no-net" ./run-fleet-audit.sh
 ```
 
-На выходе: `fleet-audit-YYYYMMDD-HHMM/` с архивами всех серверов, распакованными каталогами, сводным `INDEX.md` (таблица по парку) и `compare/` — заготовками diff'ов по ключевым артефактам.
+Формат `servers.txt`: `user@host`, `user@host:port`, IPv6 — `user@[2001:db8::1]:22`.
+
+Для **первого слепка** не используйте cloud-init `ubuntu` с `NOPASSWD: ALL`: заведите временного `auditor`, прогоните fleet, сразу снесите. Команды: [first-snapshot.md](first-snapshot.md).
+
+На выходе: `fleet-audit-YYYYMMDD-HHMM/` с архивами всех серверов, распакованными каталогами, сводным `INDEX.md` (таблица по парку) и `compare/` — заготовками diff'ов по ключевым артефактам. После успешного копирования remote-архивы удаляются (оставить: `KEEP_REMOTE=1`).
 
 ## Ключи `audit-ubuntu.sh`
 
 | Ключ | Назначение |
 |---|---|
-| `--deep` | Плюс SMART/NVMe, полный `dpkg -V`, тяжёлые сканы ФС |
-| `--log-days N` | Глубина журналов, по умолчанию 7 |
+| `--deep` | SMART/NVMe; полный `dpkg -V`; deep `du`/`find` больших файлов; полные SUID/SGID и world-writable сканы |
+| `--log-days N` | Глубина журналов, по умолчанию 7 (только целое число) |
 | `--no-net` | Без внешних ping/curl/traceroute (закрытый контур) |
 | `--no-redact` | Отключить маскирование секретов (не рекомендуется) |
 | `--out DIR` | Каталог вывода, по умолчанию `/var/tmp/server-audit` |
-| `--timeout N` | Лимит на одну команду в секундах, по умолчанию 180 |
+| `--timeout N` | Лимит на одну команду в секундах, по умолчанию 180 (нужен GNU `timeout`) |
 | `--progress on\|off\|auto` | Прогресс-бар. По умолчанию `auto` — включается, если stderr — терминал |
 | `--no-progress` | То же, что `--progress off` (для cron/pipe) |
 
+Без `--deep` тяжёлые FS-сканы заменяются лёгкими сэмплами (быстрее и безопаснее для prod).
+
 ### Ожидаемое время работы
 
-Скрипт выполняет 152 шага сбора. Реальное время зависит от размера парка пакетов, количества контейнеров/дисков и глубины журналов.
+Число шагов динамическое (~152 базово; `+1` за сетевые проверки, `+2` за `--deep`, `+1` при наличии `python3-apt`). Реальное время зависит от размера парка пакетов, количества контейнеров/дисков и глубины журналов.
 
 | Профиль сервера | `--no-net` | Обычный | `--deep` |
 |---|---|---|---|
@@ -148,19 +157,21 @@ AUDIT_ARGS="--deep --log-days 14" ./run-fleet-audit.sh
 - Пароли и токены в `KEY=value` — `PASSWORD/PASSWD/PASS/SECRET/TOKEN/APIKEY/API_KEY/ACCESS_KEY/SECRET_KEY/PRIVATE_KEY/CLIENT_SECRET/BEARER/AUTH_TOKEN/DB_PASS/MYSQL_PWD/PGPASSWORD/psk/pre-shared-key`
 - Credentials в URL: `https://user:pass@host` → `https://user:<REDACTED>@host`
 - SNMP community, WireGuard PSK, `passphrase`, `auth-user-pass`, `Authorization` и `x-api-key` заголовки
-- Публичные SSH-ключи усекаются, приватные (`-----BEGIN ... PRIVATE KEY-----`) вырезаются полностью
+- Публичные SSH-ключи усекаются; приватные PEM/OpenSSH/PGP-блоки вырезаются **целиком** (от BEGIN до END)
+- WireGuard `PrivateKey`/`PresharedKey`, JSON `"password":"…"`, YAML `password:`, URL-query `token=`/`api_key=`
 - Приватные ключи (`*.key`, `*.pem`, `id_*`, `*.p12`, `*.pfx`, `*.jks`) не копируются вообще
 - `bash_history` умышленно не собирается — часто содержит секреты в открытом виде
-- Из `/etc/shadow` берутся только первые 3 символа хеша (индикатор «пароль есть / заблокирован / пустой»)
+- Из `/etc/shadow` — только статус `empty|locked|hashed|unknown` (без префикса хеша)
 
 Перед загрузкой архива в LLM всё равно стоит глазами пройтись по `13-configs/` — в кастомных конфигах могут быть нестандартные имена полей с секретами. Ключ `--no-redact` отключает маскирование (не рекомендуется).
 
 ## Требования
 
-- Ubuntu 20.04 / 22.04 / 24.04 / 26.04 (проверено на 26.04)
-- `bash`, стандартный coreutils, `systemd`
+- Ubuntu 20.04 / 22.04 / 24.04 / 26.04 (smoke на 24.04 в CI-агенте; matrix на всех LTS — в планах)
+- `bash`, GNU `timeout` (coreutils), `systemd`; для `facts.json` желателен `python3`
 - Права `sudo` (без root часть данных недоступна — DMI, `dpkg -V`, `sshd -T`, `/etc/shadow`, конфиги некоторых сервисов)
-- Опционально: `python3-apt` (для `package-origins.tsv`), `smartmontools` (для `--deep`), `dmidecode`, `lshw`, `ethtool`, `chrony`, `lldpd`
+- Fleet-раннер: bash ≥4, `sha256sum`/`shasum`, SSH BatchMode + `sudo -n`
+- Опционально: `python3-apt` (для `package-origins.tsv`), `perl` (лучший PEM-redact), `smartmontools` (для `--deep`), `dmidecode`, `lshw`, `ethtool`, `chrony`, `lldpd`
 
 Скрипт работает и без опциональных пакетов — соответствующие артефакты помечаются как SKIPPED в `manifest.tsv`, остальной сбор продолжается.
 
@@ -214,6 +225,7 @@ sudo chmod +x /etc/cron.weekly/server-audit
 ```
 audit-ubuntu.sh        основной сборщик, кладётся на каждый сервер
 run-fleet-audit.sh     раннер по парку с рабочей машины (SSH + сбор архивов + сводный INDEX)
+first-snapshot.md      команды первого слепка: временный auditor, sudoers, снятие
 CHANGELOG.md           история версий
 LICENSE                MIT
 README.md              этот файл
